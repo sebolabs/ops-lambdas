@@ -1,6 +1,7 @@
 import os
 import sys
 import boto3
+from dateutil import parser
 from botocore.exceptions import ClientError
 
 def get_latest_ami(ec2_conn, ami_filter, nodetype):

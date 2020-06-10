@@ -3,11 +3,16 @@ var https = require('https');
 var zlib = require('zlib');
 var crypto = require('crypto');
 
-var endpoint = process.env.ES_ENDPOINT;;
+var endpoint = process.env.ES_ENDPOINT;
+
+// Set this to true if you want to debug why data isn't making it to
+// your Elasticsearch cluster. This will enable logging of failed items
+// to CloudWatch Logs.
+var logFailedResponses = false;
 
 exports.handler = function(input, context) {
     // decode input from base64
-    var zippedInput = new Buffer(input.awslogs.data, 'base64');
+    var zippedInput = new Buffer.from(input.awslogs.data, 'base64');
 
     // decompress the input
     zlib.gunzip(zippedInput, function(error, buffer) {
@@ -28,11 +33,11 @@ exports.handler = function(input, context) {
 
         // post documents to the Amazon Elasticsearch Service
         post(elasticsearchBulkData, function(error, success, statusCode, failedItems) {
-            console.log('Response: ' + JSON.stringify({ 
-                "statusCode": statusCode 
+            console.log('Response: ' + JSON.stringify({
+                "statusCode": statusCode
             }));
 
-            if (error) { 
+            if (error) {
                 console.log('Error: ' + JSON.stringify(error, null, 2));
 
                 if (failedItems && failedItems.length > 0) {
@@ -58,9 +63,9 @@ function transform(payload) {
 
     payload.logEvents.forEach(function(logEvent) {
         var timestamp = new Date(1 * logEvent.timestamp);
-        
+
         var index_prefix = ''
-        
+
         // compute source type
         if(payload.logGroup.startsWith('/aws/apigateway')) {
             index_prefix = 'apig-access-'
@@ -68,6 +73,10 @@ function transform(payload) {
             index_prefix = 'apig-exec-'
         } else if(payload.logGroup.startsWith('/aws/lambda')) {
             index_prefix = 'lambda-'
+        } else if(payload.logGroup.startsWith('/aws/vpcflowlogs')) {
+            index_prefix = 'vpcflow-'
+        } else {
+            index_prefix = 'unknown-'
         }
 
         // index name format: cwl-<index_prefix>YYYY.MM.DD
@@ -87,11 +96,11 @@ function transform(payload) {
 
         var action = { "index": {} };
         action.index._index = indexName;
-        action.index._type = payload.logGroup;
+        // action.index._type = payload.logGroup; // deprecated
         action.index._id = logEvent.id;
-        
-        bulkRequestBody += [ 
-            JSON.stringify(action), 
+
+        bulkRequestBody += [
+            JSON.stringify(action),
             JSON.stringify(source),
         ].join('\n') + '\n';
     });
@@ -123,8 +132,8 @@ function buildSource(message, extractedFields) {
     }
 
     jsonSubString = extractJson(message);
-    if (jsonSubString !== null) { 
-        return JSON.parse(jsonSubString); 
+    if (jsonSubString !== null) {
+        return JSON.parse(jsonSubString);
     }
 
     return {};
@@ -156,27 +165,34 @@ function post(body, callback) {
         response.on('data', function(chunk) {
             responseBody += chunk;
         });
+
         response.on('end', function() {
             var info = JSON.parse(responseBody);
             var failedItems;
             var success;
-            
+            var error;
+
             if (response.statusCode >= 200 && response.statusCode < 299) {
                 failedItems = info.items.filter(function(x) {
                     return x.index.status >= 300;
                 });
 
-                success = { 
+                success = {
                     "attemptedItems": info.items.length,
                     "successfulItems": info.items.length - failedItems.length,
                     "failedItems": failedItems.length
                 };
             }
 
-            var error = response.statusCode !== 200 || info.errors === true ? {
-                "statusCode": response.statusCode,
-                "responseBody": responseBody
-            } : null;
+            if (response.statusCode !== 200 || info.errors === true) {
+                // prevents logging of failed entries, but allows logging
+                // of other errors such as access restrictions
+                delete info.items;
+                error = {
+                    statusCode: response.statusCode,
+                    responseBody: info
+                };
+            }
 
             callback(error, success, response.statusCode, failedItems);
         });
@@ -196,13 +212,13 @@ function buildRequest(endpoint, body) {
     var kRegion = hmac(kDate, region);
     var kService = hmac(kRegion, service);
     var kSigning = hmac(kService, 'aws4_request');
-    
+
     var request = {
         host: endpoint,
         method: 'POST',
         path: '/_bulk',
         body: body,
-        headers: { 
+        headers: {
             'Content-Type': 'application/json',
             'Host': endpoint,
             'Content-Length': Buffer.byteLength(body),
@@ -253,4 +269,15 @@ function hmac(key, str, encoding) {
 
 function hash(str, encoding) {
     return crypto.createHash('sha256').update(str, 'utf8').digest(encoding);
+}
+
+function logFailure(error, failedItems) {
+    if (logFailedResponses) {
+        console.log('Error: ' + JSON.stringify(error, null, 2));
+
+        if (failedItems && failedItems.length > 0) {
+            console.log("Failed Items: " +
+                JSON.stringify(failedItems, null, 2));
+        }
+    }
 }
